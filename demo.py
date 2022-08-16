@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-#
-# Max-Planck-Gesellschaft zur Förderung der Wissenschaften e.V. (MPG) is
-# holder of all proprietary rights on this computer program.
-# Using this computer program means that you agree to the terms
-# in the LICENSE file included with this software distribution.
-# Any use not explicitly granted by the LICENSE is prohibited.
-#
-# Copyright©2019 Max-Planck-Gesellschaft zur Förderung
-# der Wissenschaften e.V. (MPG). acting on behalf of its Max Planck Institute
-# for Intelligent Systems. All rights reserved.
-#
-# For comments or questions, please email us at deca@tue.mpg.de
-# For commercial licensing contact, please contact ps-license@tuebingen.mpg.de
 
 import os, sys
 import argparse
@@ -99,6 +86,7 @@ def crop_face(frame, landmarks, scale=1.0):
 def main(args):
     args.crop_face = True
     spectre_cfg.pretrained_modelpath = "pretrained/spectre_model.tar"
+    spectre_cfg.model.use_tex = False
 
     spectre = SPECTRE(spectre_cfg, args.device)
     spectre.eval()
@@ -162,6 +150,7 @@ def main(args):
 
     image_paths = np.array(image_paths) # do this to index with multiple indices
     all_shape_images = []
+    all_images = []
 
     with torch.no_grad():
         for chunk_id in range(len(overlapping_indices)):
@@ -202,10 +191,12 @@ def main(args):
                     codedict[key] = codedict[key][2:-2]
 
             opdict, visdict = spectre.decode(codedict, rendering=True, vis_lmk=False, return_vis=True)
-
             all_shape_images.append(visdict['shape_images'].detach().cpu())
+            all_images.append(codedict['images'].detach().cpu())
 
     vid_shape = tensor2video(torch.cat(all_shape_images, dim=0))[2:-2] # remove padding
+    vid_orig = tensor2video(torch.cat(all_images, dim=0))[2:-2] # remove padding
+    grid_vid = np.concatenate((vid_shape, vid_orig), axis=2)
 
     assert original_video_length == len(vid_shape)
 
@@ -215,10 +206,15 @@ def main(args):
         wav = torch.FloatTensor(wav)
         if len(wav.shape) == 1:
             wav = wav.unsqueeze(0)
-        # print(fps, vid_shape.shape, wav.shape)
+
         torchvision.io.write_video(videofolder+"_shape.mp4", vid_shape, fps=fps, audio_codec='aac', audio_array=wav, audio_fps=sr)
+        torchvision.io.write_video(videofolder+"_grid.mp4", grid_vid, fps=fps,
+                                   audio_codec='aac', audio_array=wav, audio_fps=sr)
+
     else:
         torchvision.io.write_video(videofolder+"_shape.mp4", vid_shape, fps=fps)
+        torchvision.io.write_video(videofolder+"_grid.mp4", grid_vid, fps=fps)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DECA: Detailed Expression Capture and Animation')

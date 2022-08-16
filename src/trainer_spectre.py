@@ -1,17 +1,5 @@
 # -*- coding: utf-8 -*-
 #
-# Max-Planck-Gesellschaft zur Förderung der Wissenschaften e.V. (MPG) is
-# holder of all proprietary rights on this computer program.
-# Using this computer program means that you agree to the terms 
-# in the LICENSE file included with this software distribution. 
-# Any use not explicitly granted by the LICENSE is prohibited.
-#
-# Copyright©2019 Max-Planck-Gesellschaft zur Förderung
-# der Wissenschaften e.V. (MPG). acting on behalf of its Max Planck Institute
-# for Intelligent Systems. All rights reserved.
-#
-# For comments or questions, please email us at deca@tue.mpg.de
-# For commercial licensing contact, please contact ps-license@tuebingen.mpg.de
 
 import os
 import torch
@@ -26,7 +14,6 @@ from datetime import datetime
 from tqdm import tqdm
 import torchaudio
 from .utils import util
-from spectre.config import cfg
 torch.backends.cudnn.benchmark = True
 from .utils import lossfunc
 from .models.expression_loss import ExpressionLossNet
@@ -38,47 +25,33 @@ sys.path.append("external/Visual_Speech_Recognition_for_Multiple_Languages")
 
 class Trainer(object):
     def __init__(self, model, config=None, device='cuda:0'):
-        if config is None:
-            self.cfg = cfg
-        else:
-            self.cfg = config
+        self.cfg = config
         self.device = device
-        self.batch_size = self.cfg.dataset.batch_size
-        self.image_size = self.cfg.dataset.image_size
-        self.uv_size = self.cfg.model.uv_size
-        self.K = self.cfg.dataset.K
+
 
         # deca model
         self.spectre = model.to(self.device)
-        self.opt = torch.optim.Adam(
-                                self.spectre.E_expression.parameters(),
-                                lr=self.cfg.train.lr)
 
-
-        # initialize outputs close to DECA result (since we find residual from coarse DECA estimate)
-        self.spectre.E_expression.layers[0].weight.data *= 0.001
-        self.spectre.E_expression.layers[0].bias.data *= 0.001
-
+        self.global_step = 0
 
         logger.add(os.path.join(self.cfg.output_dir, self.cfg.train.log_dir, 'train.log'))
         if self.cfg.train.write_summary:
             from torch.utils.tensorboard import SummaryWriter
             self.writer = SummaryWriter(log_dir=os.path.join(self.cfg.output_dir, self.cfg.train.log_dir))
 
+
+        self.prepare_training_losses()
+
+    def prepare_training_losses(self):
+
         # ----- initialize resnet trained from EMOCA https://github.com/radekd91/emoca for expression loss ----- #
-        self.expression_net = ExpressionLossNet().to(device)
+        self.expression_net = ExpressionLossNet().to(self.device)
         self.emotion_checkpoint = torch.load("data/ResNet50/checkpoints/deca-epoch=01-val_loss_total/dataloader_idx_0=1.27607644.ckpt")['state_dict']
         self.emotion_checkpoint['linear.0.weight'] = self.emotion_checkpoint['linear.weight']
         self.emotion_checkpoint['linear.0.bias'] = self.emotion_checkpoint['linear.bias']
 
         m, u = self.expression_net.load_state_dict(self.emotion_checkpoint, strict=False)
-        # print('Emotion Missing keys', m)
-        # print('Emotion Unexpected keys', u)
-        # print(self.expression_net)
         self.expression_net.eval()
-
-
-        self.global_step = 0
 
         # ----- initialize lipreader network for lipread loss ----- #
         from external.Visual_Speech_Recognition_for_Multiple_Languages.lipreading.model import Lipreading
@@ -90,8 +63,7 @@ class Trainer(object):
         config.read('configs/lipread_config.ini')
         self.lip_reader = Lipreading(
             config,
-            # feats_position=self.cfg.train.lip_features,
-            device=device
+            device=self.device
         )
 
         """ this lipreader is used during evaluation to obtain an estimate of some lip reading metrics
@@ -99,7 +71,7 @@ class Trainer(object):
 
         https://github.com/facebookresearch/av_hubert/
         
-        to obtain fair results
+        to obtain unbiased results
         """
 
         # ---- initialize values for cropping the face around the mouth for lipread loss ---- #
@@ -125,7 +97,6 @@ class Trainer(object):
 
         print("E flame parameters: ", count_parameters(self.spectre.E_flame))
         print("flame parameters: ", count_parameters(self.spectre.flame))
-
 
 
 
@@ -252,7 +223,7 @@ class Trainer(object):
         losses['lipread'] = 1-torch.mean(lr[loss_indices])
 
         # nonlinear regularization of expression parameters
-        reg = torch.sum((codedict['exp'][loss_indices]) ** 2,dim=-1) / 2
+        reg = torch.sum((codedict['exp'][loss_indices] - deca_exp[loss_indices]) ** 2,dim=-1) / 2
 
         weight_vector = torch.ones_like(reg).cuda()
         weight_vector[reg > 40] = 2e-3
@@ -278,11 +249,6 @@ class Trainer(object):
         if self.cfg.model.regularization_type=='nonlinear':
             losses['expression_reg'] = loss_to_log
 
-        # remove unusable keys
-        # opdict.pop('landmarks3d_world',None)
-        # opdict.pop('grid',None)
-        # opdict.pop('normal_images',None)
-        # opdict.pop('albedo',None)
 
         return losses, opdict, codedict
 
@@ -343,6 +309,14 @@ class Trainer(object):
         start_epoch = 0
         self.global_step = 0
 
+        # initialize outputs close to DECA result (since we find residual from coarse DECA estimate)
+        self.spectre.E_expression.layers[0].weight.data *= 0.001
+        self.spectre.E_expression.layers[0].bias.data *= 0.001
+
+        self.opt = torch.optim.Adam(
+                                self.spectre.E_expression.parameters(),
+                                lr=self.cfg.train.lr)
+
         scheduler = torch.optim.lr_scheduler.MultiStepLR(self.opt,[50000],gamma=0.2)
 
         for epoch in range(start_epoch, self.cfg.train.max_epochs):
@@ -389,11 +363,10 @@ class Trainer(object):
                     model_dict = self.spectre.model_dict()
                     model_dict['opt'] = self.opt.state_dict()
                     model_dict['global_step'] = self.global_step
-                    model_dict['batch_size'] = self.batch_size
+                    model_dict['batch_size'] = self.cfg.dataset.batch_size
                     torch.save(model_dict, os.path.join(self.cfg.output_dir, 'model' + '.tar'))
                     os.makedirs(os.path.join(self.cfg.output_dir, 'models'), exist_ok=True)
                     torch.save(model_dict, os.path.join(self.cfg.output_dir, 'models', f'{self.global_step:08}.tar'))
-
 
                 # ---- take one random sample of validation and visualize it ---- #
                 if self.global_step % self.cfg.train.vis_steps == 0 and self.global_step > 0:
@@ -412,14 +385,16 @@ class Trainer(object):
 
                 # ---- evaluate the model on the test set every 10k iters ---- #
                 if self.global_step % self.cfg.train.evaluation_steps == 0 and self.global_step > 0:
-                    self.evaluate()
+                    self.evaluate(self.test_datasets)
 
                 self.global_step+=1
 
                 scheduler.step()
 
+        # evaluate one last time after training completes
+        self.evaluate(self.test_datasets)
 
-    def evaluate(self):
+    def evaluate(self, datasets=None):
         save_dir = os.path.join(self.cfg.output_dir, 'test_videos_%06d'%self.global_step)
         os.makedirs(save_dir, exist_ok=True)
         print('Starting Evaluation ...')
@@ -434,8 +409,9 @@ class Trainer(object):
         count_vids = 0
 
 
-        for _, dataset in enumerate([self.test_dataset]):
-            indices = list(range(len(self.test_dataset)))
+        for _, dataset in enumerate(datasets):
+            indices = np.arange(0,len(dataset),1)
+
             with torch.no_grad():
                 for idx in tqdm(indices):
                     batch = dataset[idx]
@@ -457,23 +433,20 @@ class Trainer(object):
                     """ SPECTRE uses a temporal convolution of size 5. 
                     Thus, in order to predict the parameters for a contiguous video with need to 
                     process the video in chunks of overlap 2, dropping values which were computed from the 
-                    temporal kernel which uses pad 'same'. For the start and end of the video we
-                    pad using the first and last frame of the video. 
+                    temporal kernel which uses pad 'same'. For the start and end of the video we drop 
+                    the first two and last frames (look at the demo for a version with padding).
                     e.g., consider a video of size 48 frames and we want to predict it in chunks of 20 frames 
-                    (due to memory limitations). We first pad the video two frames at the start and end using
-                    the first and last frames correspondingly, making the video 52 frames length.
-
-                    Then we process independently the following chunks:
+                    (due to memory limitations). 
+                    We process independently the following chunks:
                     [[ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19]
                      [16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35]
-                     [32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51]]
+                     [32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47]]
 
                      In the first chunk, after computing the 3DMM params we drop 0,1 and 18,19, since they were computed 
                      from the temporal kernel with padding (we followed the same procedure in training and computed loss 
                      only from valid outputs of the temporal kernel) In the second chunk, we drop 16,17 and 34,35, and in 
-                     the last chunk we drop 32,33 and 50,51. As a result we get:
-                     [2..17], [18..33], [34..49] (end included) which correspond to all frames of the original video 
-                     (removing the initial padding).     
+                     the last chunk we drop 32,33 and 46,47. As a result we get results for frames:
+                     [2..17], [18..33], [34..47] (end included).     
                     """
                     L = 50  # chunk size
 
@@ -481,17 +454,19 @@ class Trainer(object):
                     landmarks = batch['landmark']
 
                     # we do this ugly workaround because mode replicate does not handle 4D inputs
-                    images = F.pad(images,(0,0,0,0,0,0,2,2),mode='constant', value=0)
-                    images[0] = images[2]
-                    images[1] = images[2]
-                    images[-1] = images[-3]
-                    images[-2] = images[-3]
-
-                    landmarks = F.pad(landmarks,(0,0,0,0,2,2),mode='constant', value=0)
-                    landmarks[0] = landmarks[2]
-                    landmarks[1] = landmarks[2]
-                    landmarks[-1] = landmarks[-3]
-                    landmarks[-2] = landmarks[-3]
+                    # doing this padding results in slight under-evaluation of wer,cer, ver, vwer from our lipread
+                    # however av_hubert is not affected
+                    # images = F.pad(images,(0,0,0,0,0,0,2,2),mode='constant', value=0)
+                    # images[0] = images[2]
+                    # images[1] = images[2]
+                    # images[-1] = images[-3]
+                    # images[-2] = images[-3]
+                    #
+                    # landmarks = F.pad(landmarks,(0,0,0,0,2,2),mode='constant', value=0)
+                    # landmarks[0] = landmarks[2]
+                    # landmarks[1] = landmarks[2]
+                    # landmarks[-1] = landmarks[-3]
+                    # landmarks[-2] = landmarks[-3]
 
                     codedicts = []
 
@@ -540,7 +515,8 @@ class Trainer(object):
                                 all_losses[key] = 0
 
                             all_losses[key] += losses[key]*opdict['rendered_images'].shape[0]
-                            count_frames += opdict['rendered_images'].shape[0]
+
+                        count_frames += opdict['rendered_images'].shape[0]
 
                         # ---- accumulate images and landmarks for the video ---- #
                         all_images.append(opdict['rendered_images'])
@@ -582,28 +558,43 @@ class Trainer(object):
 
 
                     # ---- stack landmarks and video images ---- #
-                    vid_rendered = util.tensor2video(torch.cat(all_images, dim=0)) # video of rendered images (shape + texture)
-                    vid_shape = util.tensor2video(torch.cat(all_shape_images, dim=0))  # video of shape - output of SPECTRE
-                    vid_orig = util.tensor2video(torch.cat(all_orig_images, dim=0)) # video of original images
-                    vid_landmarks = torch.cat(vid_landmarks, dim=0) # landmarks of video
+                    vid = torch.cat(all_images, dim=0)[2:-2]; vid_rendered = util.tensor2video(vid) # video of rendered images (shape + texture)
+                    vid_shape = util.tensor2video(torch.cat(all_shape_images, dim=0))[2:-2]  # video of shape - output of SPECTRE
+                    vid_orig = util.tensor2video(torch.cat(all_orig_images, dim=0))[2:-2] # video of original images
+                    vid_landmarks = torch.cat(vid_landmarks, dim=0)[2:-2] # landmarks of video
 
-                    assert vid_rendered.shape[0] == images.size(0)
+                    # assert vid_rendered.shape[0] == images.size(0)# - 4
+
+                    grid_vid = np.concatenate((vid_shape, vid_orig), axis=2)
 
                     # ---- load wav file as well to put it in the output video ---- #
                     if 'wav_path' in batch:
                         wav, sr = torchaudio.load(batch['wav_path'])
+                        wav = wav#[:,1280:-1280]
 
                         # ---- save rendered, shape, and original videos removing pads---- #
-                        torchvision.io.write_video(out_vid_path, vid_rendered[2:-2], fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
-                        torchvision.io.write_video(out_vid_path.replace(".mp4","_shape.mp4"), vid_shape[2:-2], fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
-                        torchvision.io.write_video(out_vid_path.replace(".mp4","_orig.mp4"), vid_orig[2:-2], fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
+                        torchvision.io.write_video(out_vid_path, vid_rendered, fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
+                        torchvision.io.write_video(out_vid_path.replace(".mp4","_shape.mp4"), vid_shape, fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
+                        # torchvision.io.write_video(out_vid_path.replace(".mp4","_orig.mp4"), vid_orig, fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
+                        torchvision.io.write_video(out_vid_path.replace(".mp4","_grid.mp4"), grid_vid, fps=self.cfg.dataset.fps, audio_codec='aac', audio_array=wav, audio_fps=16000)
                     else:
-                        torchvision.io.write_video(out_vid_path, vid_rendered[2:-2], fps=self.cfg.dataset.fps)
-                        torchvision.io.write_video(out_vid_path.replace(".mp4","_shape.mp4"), vid_shape[2:-2], fps=self.cfg.dataset.fps)
-                        torchvision.io.write_video(out_vid_path.replace(".mp4","_orig.mp4"), vid_orig[2:-2], fps=self.cfg.dataset.fps)
+                        torchvision.io.write_video(out_vid_path, vid_rendered, fps=self.cfg.dataset.fps)
+                        torchvision.io.write_video(out_vid_path.replace(".mp4","_shape.mp4"), vid_shape, fps=self.cfg.dataset.fps)
+                        # torchvision.io.write_video(out_vid_path.replace(".mp4","_orig.mp4"), vid_orig, fps=self.cfg.dataset.fps)
+                        torchvision.io.write_video(out_vid_path.replace(".mp4","_grid.mp4"), grid_vid, fps=self.cfg.dataset.fps)
+
+
+                    # you can uncomment the following and change ffmpeg paths if you want to create a grid to compare with other methods
+                    # if enn == 0:
+                    #     st = "ffmpeg -i {} -i {} -i {}  -filter_complex hstack=inputs=3 {} -y ".format(
+                    #         os.path.join("/gpu-data3/filby/EAVTTS_experiments/audiovisual_DECA_results/cross/LRS3_test/DECA/", vid_name + "_shape.mp4"),
+                    #         os.path.join("/gpu-data3/filby/EAVTTS_experiments/audiovisual_DECA_results/cross/LRS3_test/EMOCA/", vid_name + "_shape.mp4"),
+                    #         os.path.join(out_vid_path.replace(".mp4", "_grid.mp4")),
+                    #         os.path.join(out_vid_path.replace(".mp4", "_shape_grid.mp4"))
+                    #     )
 
                     # ---- extract and save the mouth as well - useful for evaluation with av hubert afterwards ---- #
-                    mouth_sequence = self.cut_mouth(torch.cat(all_images, dim=0), vid_landmarks, convert_grayscale=True)
+                    mouth_sequence = self.cut_mouth(vid, vid_landmarks, convert_grayscale=True)
 
                     if 'text' in batch:
                         from utils.lipread_utils import convert_text_to_visemes, save2avi, predict_text
@@ -637,20 +628,22 @@ class Trainer(object):
                         count_vids += 1
 
                         print(
-                            "avg WER: {:.2f}\tavg CER: {:.2f}\t".format(all_losses['wer']/count_vids, all_losses['cer']/count_vids)+
-                            "avg VERW: {:.2f}\tavg VER: {:.2f}".format(all_losses['vwer']/count_vids, all_losses['ver']/count_vids)
+                            "cur WER: {:.2f}\tcur CER: {:.2f}\t avg WER: {:.2f}\tavg CER: {:.2f}\n".format(100*wer, 100*cer, 100*all_losses['wer']/count_vids, 100*all_losses['cer']/count_vids)+
+                            "cur VWER: {:.2f}\tcur VER: {:.2f}\t avg VWER: {:.2f}\tavg VER: {:.2f}".format(100*vwer, 100*ver, 100*all_losses['vwer']/count_vids, 100*all_losses['ver']/count_vids)
                         )
 
                     from utils.lipread_utils import save2avi
                     save2avi(out_vid_path.replace(".mp4", "_mouth.avi"), data=util.tensor2video(mouth_sequence,gray=True),
                              fps=self.cfg.dataset.fps)
 
-
-
                 loss_info = f"ExpName: {self.cfg.exp_name} \nEpoch: {self.epoch}, Testing, Time: {datetime.now().strftime('%Y-%m-%d-%H:%M:%S')} \n"
                 for k, v in all_losses.items():
-                    loss_info = loss_info + f'{k}: {v:.6f}, '
-                    self.writer.add_scalar('val_loss/' + k, v, global_step=self.global_step)
+                    if k in ['wer', 'cer', 'vwer', 'ver']:
+                        loss_info += f"{k}: {100*v/count_vids:.2f}%\n"
+                        self.writer.add_scalar('val_loss/' + k, 100*v/count_vids, global_step=self.global_step)
+                    else:
+                        loss_info = loss_info + f'{k}: {v/count_frames:.6f}, '
+                        self.writer.add_scalar('val_loss/' + k, v/count_frames, global_step=self.global_step)
                 logger.info(loss_info)
 
     def create_grid(self, opdict):
@@ -674,6 +667,20 @@ class Trainer(object):
         from datasets.datasets import get_datasets_LRS3
         self.train_dataset, self.val_dataset, self.test_dataset = get_datasets_LRS3(self.cfg.dataset)
 
+        self.test_datasets = []
+        if 'LRS3' in self.cfg.test_datasets:
+            self.test_datasets.append(self.test_dataset)
+
+        if 'TCDTIMIT' in self.cfg.test_datasets:
+            from datasets.extra_datasets import get_datasets_TCDTIMIT
+            _, _, test_dataset_TCDTIMIT = get_datasets_TCDTIMIT(self.cfg.dataset)
+            self.test_datasets.append(test_dataset_TCDTIMIT)
+
+        if 'MEAD' in self.cfg.test_datasets:
+            from datasets.extra_datasets import get_datasets_MEAD
+            _, _, test_dataset_MEAD = get_datasets_MEAD(self.cfg.dataset)
+            self.test_datasets.append(test_dataset_MEAD)
+
         def collate_fn(batch):
             batch = list(filter(lambda x: x is not None, batch))
             if not batch:  # edge case
@@ -682,17 +689,13 @@ class Trainer(object):
 
         logger.info('---- training data numbers: ', len(self.train_dataset), len(self.val_dataset))
 
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.cfg.dataset.batch_size, shuffle=True,
                             num_workers=self.cfg.dataset.num_workers,
                             pin_memory=True,
                             drop_last=True, collate_fn=collate_fn)
 
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True,
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.cfg.dataset.batch_size, shuffle=True,
                             num_workers=4,
                             pin_memory=True,
                             drop_last=False, collate_fn=collate_fn)
 
-        self.test_dataloader = DataLoader(self.test_dataset, batch_size=1, shuffle=False,
-                            num_workers=4,
-                            pin_memory=False,
-                            drop_last=False, collate_fn=collate_fn)
